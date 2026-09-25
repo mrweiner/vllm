@@ -91,6 +91,17 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _narrate_wait_gate(gate: str, skipped_waiting) -> None:
+    # Narrate a scheduler-step budget gate that exits the waiting pass
+    # while requests are parked on an in-flight KV transfer. Without this
+    # line a budget-gated break is invisible: the parked requests show
+    # only as a Deferred counter that does not move.
+    if len(skipped_waiting):
+        logger.info(
+            "[scheduler-wait-gate] %s parked=%d", gate, len(skipped_waiting)
+        )
+
+
 def _build_kv_connector_block_state(
     kv_cache_config: KVCacheConfig,
     kv_cache_manager: KVCacheManager,
@@ -1186,6 +1197,17 @@ class Scheduler(SchedulerInterface):
                             self.connector is not None
                             and self.connector.has_pending_block_frees()
                         ):
+                            # A running request failed block allocation while
+                            # the KV connector still holds pending block frees;
+                            # the decode-side allocation retry breaks here
+                            # until the connector drains its frees.
+                            logger.info(
+                                "[scheduler-free-wait-break] request=%s "
+                                "tokens=%d free_blocks=%d",
+                                request.request_id,
+                                num_new_tokens,
+                                self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                            )
                             break
 
                         if not allow_preemption:
@@ -1350,11 +1372,13 @@ class Scheduler(SchedulerInterface):
                     input_budget <= draft_slots
                     or draft_input_budget < separate_draft_input_tokens
                 ):
+                    _narrate_wait_gate("input-budget", step_skipped_waiting)
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_running_reqs:
+                    _narrate_wait_gate("max-running", step_skipped_waiting)
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
