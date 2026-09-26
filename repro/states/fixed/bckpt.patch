@@ -1,0 +1,48 @@
+--- a/boundary_checkpoint.py
+
++++ b/boundary_checkpoint.py
+
+@@ -5,6 +5,9 @@
+
+ 
+ from collections.abc import Iterable
+ from typing import TYPE_CHECKING, Any, cast
++
++import os
++import time
+ 
+ import torch
+ 
+@@ -18,6 +21,12 @@
+
+     RESPONSE_CHECKPOINT_SLOT,
+ )
+ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, iter_layer_specs
++
++# f9: the capture_attention completion wait must be bounded. These are
++# small tail copies (microseconds-to-ms healthy path); a wedged kernel
++# otherwise holds the engine-core loop forever. On expiry we raise —
++# the loud-failure family: an incomplete capture must not be read.
++_COPY_WAIT_TIMEOUT = float(os.getenv("VLLM_BOUNDARY_COPY_TIMEOUT", "120.0"))
+ from vllm.v1.worker.mamba_utils import _reinterpret_u64_as_i64
+ 
+ if TYPE_CHECKING:
+@@ -903,7 +912,16 @@
+
+         self._completion.record()
+ 
+     def wait_for_copies(self) -> None:
+-        self._completion.synchronize()
++        print("[REPRO] counters f9_wait_calls=1", flush=True)
++        deadline = time.monotonic() + _COPY_WAIT_TIMEOUT
++        while not self._completion.query():
++            if time.monotonic() >= deadline:
++                raise RuntimeError(
++                    "boundary checkpoint copies did not complete within "
++                    f"{_COPY_WAIT_TIMEOUT}s; refusing to read a possibly "
++                    "incomplete capture"
++                )
++            time.sleep(0.005)
+ 
+     def get_hidden_states(self, block_id: int, *, draft: bool = False) -> torch.Tensor:
+         shape = self.spec_hidden_shape if draft else self.hidden_shape

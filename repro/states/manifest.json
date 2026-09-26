@@ -1,0 +1,118 @@
+{
+ "generated_at": "2026-09-25T23:54:43.845151+00:00",
+ "provenance": {
+  "vllm_fork": {
+   "origin": "github.com/local-inference-lab/vllm (filed PRs #901/#902 mirrored at mrweiner/vLLM)",
+   "base_ref": "tag vllm-jovian-cu134-beta-22476af54c637cbb7c7d8193addd160da83a5ce3",
+   "base_commit": "22476af54c637cbb7c7d8193addd160da83a5ce3",
+   "note": "deployed vllm/v1/core/sched/scheduler.py (sha 264988b3803d5a70...) equals afb03b311's PARENT (4f66cb92d content) and contains NONE of the admission-guard markers; afb03b311 (branch fix/scheduler-admission-guards, authored 18:34:27Z during the collapse) records the ported guard batch but was never deployed. BASE is event-time code; #901's twins are NOT in BASE. boundary_checkpoint.py matches no fork commit (patch-applied wheel content)"
+  },
+  "lmcache_fork": {
+   "origin": "github.com/local-inference-lab/LMCache (filed PRs #95/#96/#97 mirrored at mrweiner/LMCache)",
+   "base_ref": "commit 9acfefdb59abde6e0500a6a9518c85d816465258 (deployed build string 0.5.3.dev401+lil.cu134.g9acfefdb59ab; the org integration branch has since moved to 15d5a80a7ed380d7b0a0e016004b9961243dcb48 \u2014 NOT the A/B base; the fork branch still pins 9acfefdb)",
+   "base_commit": "9acfefdb59abde6e0500a6a9518c85d816465258",
+   "pr_head_shas": {
+    "95": "4439c6fcadc87254757677e70e814dcc79b6d305 (fix/recurrent-preempt-flush-bound)",
+    "96": "86260bdc45e4997f1851a6c6de1083102f3ea475 (fix/checkpoint-wedge-deadlines; the PR body itself flags the published-but-unreadable instant-failure variant as REPORTED BUT NOT ADDRESSED \u2014 round-5 re-registration at zero effect)",
+    "97": "fix/checkpoint-layout-deadline tip (full sha in fork-refs.json)"
+   }
+  }
+ },
+ "off_state": {
+  "choice": "source-level disable of the recurrent checkpoint scheduling path: checkpoint_scheduler.py handles() returns False, so no checkpoint store or restore is ever scheduled for a request",
+  "why_not_config": "RecurrentCheckpointPolicy (vllm/config/cache.py) has no \"off\" value; \"aligned\" keeps MORE checkpoints, not fewer \u2014 there is no config knob",
+  "removes": "recurrent checkpoint stores and restores (the restore/re-prefill amplifier)",
+  "keeps_prefix_reuse": true,
+  "interpretation": "OFF beats BASE => the checkpointing feature (stores+restores) is net-harmful for this workload. The leg isolates the restore path: LMCache prefix L1/L2 reuse stays enabled, so the beats-BASE rule needs no restatement."
+ },
+ "states": {
+  "base": {
+   "bridge": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/lmcache/integration/vllm/checkpoint_scheduler.py",
+    "sha256": "be3734b34fa2971750b81fa1807847b797a2279d87a0abade0810aa93c68d4d4"
+   },
+   "sched": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py",
+    "sha256": "35b0b14bda7756cbf89cd7683982313bc3c294adf15786263c91f5520b2a9f59"
+   },
+   "conn": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/lmcache/integration/vllm/recurrent_checkpoint_connector.py",
+    "sha256": "5fc0db6c8ab6a33455ee7db357e6f545610a208adc041ff333295681a9071bc8"
+   },
+   "worker": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/lmcache/v1/multiprocess/checkpoint_transfer.py",
+    "sha256": "9d2e4aa33ee3a03fb519fdc249a1fb990ddeee1e8322efcde5be7e17d7202227"
+   },
+   "bckpt": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/boundary_checkpoint.py",
+    "sha256": "40f31de203db6d480a62055f40689f8600a68b6b681c751552479d274f00e009"
+   }
+  },
+  "fixed": {
+   "bridge": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/lmcache/integration/vllm/checkpoint_scheduler.py",
+    "sha256": "9844ce5c55da5b1024a606d8906168f3b7e1068db8f267fb81e0f189c65ce292"
+   },
+   "sched": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py",
+    "sha256": "cc839e28842e20efec48020ac1d1693c4402018d49263e925f17b61953869eff"
+   },
+   "conn": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/lmcache/integration/vllm/recurrent_checkpoint_connector.py",
+    "sha256": "87573c4f5e8ba460e6d23e8b82b1483116205eed2094aaea7f1db8992d9a61b7"
+   },
+   "worker": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/lmcache/v1/multiprocess/checkpoint_transfer.py",
+    "sha256": "6fa1c22b8d02e222bbc3b411f537401bc4a38e810080dbdcd2b96d0d958a3fcf"
+   },
+   "bckpt": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/boundary_checkpoint.py",
+    "sha256": "14dcb45478b7f459db5933ee7db83417ebaefb787a4646b56cbc0d19dfd4144b"
+   }
+  },
+  "fixed901": {
+   "bridge": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/lmcache/integration/vllm/checkpoint_scheduler.py",
+    "sha256": "be3734b34fa2971750b81fa1807847b797a2279d87a0abade0810aa93c68d4d4"
+   },
+   "sched": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py",
+    "sha256": "cc839e28842e20efec48020ac1d1693c4402018d49263e925f17b61953869eff"
+   },
+   "conn": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/lmcache/integration/vllm/recurrent_checkpoint_connector.py",
+    "sha256": "5fc0db6c8ab6a33455ee7db357e6f545610a208adc041ff333295681a9071bc8"
+   },
+   "worker": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/lmcache/v1/multiprocess/checkpoint_transfer.py",
+    "sha256": "9d2e4aa33ee3a03fb519fdc249a1fb990ddeee1e8322efcde5be7e17d7202227"
+   },
+   "bckpt": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/boundary_checkpoint.py",
+    "sha256": "40f31de203db6d480a62055f40689f8600a68b6b681c751552479d274f00e009"
+   }
+  },
+  "off": {
+   "bridge": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/lmcache/integration/vllm/checkpoint_scheduler.py",
+    "sha256": "06ee43ddd32b03c6317f7923c1884b631c23ad5e1ce18616886230e206d421ba"
+   },
+   "sched": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py",
+    "sha256": "35b0b14bda7756cbf89cd7683982313bc3c294adf15786263c91f5520b2a9f59"
+   },
+   "conn": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/lmcache/integration/vllm/recurrent_checkpoint_connector.py",
+    "sha256": "5fc0db6c8ab6a33455ee7db357e6f545610a208adc041ff333295681a9071bc8"
+   },
+   "worker": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/lmcache/v1/multiprocess/checkpoint_transfer.py",
+    "sha256": "9d2e4aa33ee3a03fb519fdc249a1fb990ddeee1e8322efcde5be7e17d7202227"
+   },
+   "bckpt": {
+    "container_path": "/opt/venv/lib/python3.12/site-packages/vllm/v1/worker/gpu/boundary_checkpoint.py",
+    "sha256": "40f31de203db6d480a62055f40689f8600a68b6b681c751552479d274f00e009"
+   }
+  }
+ }
+}

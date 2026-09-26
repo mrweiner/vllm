@@ -1,0 +1,235 @@
+--- a/checkpoint_scheduler.py
+
++++ b/checkpoint_scheduler.py
+
+@@ -23,6 +23,30 @@
+
+ from lmcache.v1.multiprocess.protocols.base import RequestType
+ 
+ logger = init_logger(__name__)
++
++# [STORM] diagnosis instrument (P1): per-request park accounting. Maps
++# request_id -> (first-park monotonic clock, poll count). Cleared wholesale
++# past a fixed bound; entry removal happens on the park-exit line.
++_PARK_TRACE: dict[str, tuple[float, int]] = {}
++
++
++def _park_note(request_id, tag=None, verdict=None):
++    if len(_PARK_TRACE) > 4096:
++        _PARK_TRACE.clear()
++    now = time.monotonic()
++    first, polls = _PARK_TRACE.get(request_id, (now, 0))
++    if verdict is None:
++        _PARK_TRACE[request_id] = (first, polls + 1)
++        logger.info(
++            "[STORM] park %s request=%s poll=%d parked=%.1fs",
++            tag, request_id, polls + 1, now - first,
++        )
++    elif request_id in _PARK_TRACE:
++        logger.info(
++            "[STORM] park-exit %s request=%s polls=%d total=%.1fs",
++            verdict, request_id, polls, now - first,
++        )
++        _PARK_TRACE.pop(request_id, None)
+ 
+ # Directory lookups per request, including the first. A failed restore makes
+ # the server invalidate the missing generation, so each retry receives the
+@@ -127,6 +151,11 @@
+
+ 
+     @property
+     def has_pending(self) -> bool:
++        _repro_now = time.monotonic()
++        if _repro_now - getattr(self, "_repro_last", 0.0) > 5.0:
++            self._repro_last = _repro_now
++            logger.info("[REPRO] ckpt pending=%d lookups=%d",
++                        len(self._tasks), len(self._lookups))
+         """Whether connector-only steps are needed to negotiate or drain copies."""
+         return self._layout is None or bool(self._tasks)
+ 
+@@ -136,7 +165,7 @@
+
+         Per-request LoRA content revisions are not part of the manifest namespace;
+         such requests may use GPU-local caching but never this external directory.
+         """
+-        return request.lora_request is None and self._cache.supports_request(request)
++        return False  # [REPRO] off state: checkpoint path disabled
+ 
+     def accept_layouts(self, layouts: dict[int, dict[str, Any]]) -> None:
+         """Validate identical byte interpretation across all contributing ranks.
+@@ -172,6 +201,7 @@
+
+             drain, so their completion cannot cancel or erase another lookup.
+         """
+         if request.request_id in self._cancelled:
++            _park_note(request.request_id, "cancelled")
+             return False
+         if not self.handles(request) or not self._manager.prefix_cache_lookup_enabled(
+             request
+@@ -181,6 +211,7 @@
+
+         if local is not None and local.num_tokens == request.num_tokens:
+             return True
+         if self._layout is None:
++            _park_note(request.request_id, "layout")
+             return False
+         state = self._lookups.get(request.request_id)
+         if state is None:
+@@ -190,13 +221,17 @@
+
+                 self._client.submit_request(RequestType.CHECKPOINT_FIND, [roots.roots]),
+             )
+             self._lookups[request.request_id] = state
++            _park_note(request.request_id, "fresh-lookup")
+             return False
+         if state.done:
++            _park_note(request.request_id, verdict="done")
+             return True
+         if state.task_id is not None:
++            _park_note(request.request_id, "task-in-flight")
+             return False
+         if not state.future.query():
+             if time.monotonic() - state.started < self._lookup_timeout:
++                _park_note(request.request_id, "reply-pending")
+                 return False
+             # An unanswered lookup must not park the request indefinitely.
+             logger.warning(
+@@ -206,6 +241,7 @@
+
+                 self._lookup_timeout,
+             )
+             state.done = True
++            _park_note(request.request_id, verdict="deadline-expired")
+             return True
+         try:
+             manifest = state.future.result()
+@@ -216,11 +252,30 @@
+
+                 request.request_id,
+             )
+             state.done = True
+-            return True
+-        if manifest is None or (
+-            local is not None and manifest.prefix.num_tokens <= local.num_tokens
+-        ):
++            _park_note(request.request_id, verdict="done")
++            return True
++        if manifest is None:
++            # [STORM] instrument (P5, item-5 site 2a): silent directory miss.
++            logger.info(
++                "Recurrent checkpoint find for request %s returned no manifest "
++                "(directory miss); recomputing its prompt",
++                request.request_id,
++            )
+             state.done = True
++            _park_note(request.request_id, verdict="done")
++            return True
++        if local is not None and manifest.prefix.num_tokens <= local.num_tokens:
++            # [STORM] instrument (P5, item-5 site 2b): benign downgrade.
++            logger.info(
++                "Recurrent checkpoint find for request %s returned a shorter "
++                "manifest than the local cache (%d <= %d tokens); admitting "
++                "without import",
++                request.request_id,
++                manifest.prefix.num_tokens,
++                local.num_tokens,
++            )
++            state.done = True
++            _park_note(request.request_id, verdict="done")
+             return True
+         if len(self._tasks) >= self._max_tasks:
+             logger.info(
+@@ -231,6 +286,7 @@
+
+                 len(self._tasks),
+             )
+             state.done = True
++            _park_note(request.request_id, verdict="done")
+             return True
+         try:
+             payload, positions = self._validate_manifest(manifest, state.roots)
+@@ -251,6 +307,7 @@
+
+                 exc_info=True,
+             )
+             state.done = True
++            _park_note(request.request_id, verdict="done")
+             return True
+         if checkpoint is None:
+             # Insufficient GPU capacity is not an external-cache miss. Permit
+@@ -266,10 +323,12 @@
+
+                     request.request_id,
+                     self._manager.block_pool.get_num_free_blocks(),
+                 )
++            _park_note(request.request_id, verdict="capacity-refusal")
+             return True
+         task = self._make_task(manifest, checkpoint, "RETRIEVE")
+         self._tasks[task.task_id] = _PendingTask(task, checkpoint, request.request_id)
+         state.task_id = task.task_id
++        _park_note(request.request_id, "task-in-flight")
+         return False
+ 
+     def external_tokens(self, request: "Request") -> int:
+@@ -511,6 +570,21 @@
+
+                                 pending.checkpoint.checkpoint_id, rank
+                             )
+                         )
++                    if not published:
++                        # [STORM] instrument (P5, item-5 site 5): the silent
++                        # neither-published-nor-discarded fall-through. The
++                        # loop is last-rank-wins by design; the FINAL False
++                        # is the anomalous signal (intermediate False is the
++                        # normal collective-pending state).
++                        logger.warning(
++                            "Recurrent checkpoint restore of %d tokens for "
++                            "request %s was not published after %.1f s "
++                            "(final rank acknowledgement False); recomputing "
++                            "its prompt",
++                            pending.task.manifest.prefix.num_tokens,
++                            pending.request_id,
++                            time.monotonic() - pending.created,
++                        )
+                     if published and state is not None:
+                         state.checkpoint_id = pending.checkpoint.checkpoint_id
+                     elapsed = time.monotonic() - pending.created
+@@ -532,6 +606,15 @@
+
+                         and state.attempts < _MAX_LOOKUP_ATTEMPTS
+                         and time.monotonic() - state.started < self._lookup_timeout
+                     )
++                    _repro_exc = None
++                    _repro_fut = getattr(pending, "future", None)
++                    if _repro_fut is not None and _repro_fut.done():
++                        try:
++                            _repro_exc = _repro_fut.exception()
++                        except Exception:
++                            pass
++                    logger.info("[REPRO] ack_reason %s",
++                                _repro_exc or "no-exception-recorded")
+                     logger.info(
+                         "Recurrent checkpoint restore of %d tokens failed for "
+                         "request %s on ranks %s after %.1f s%s",
+@@ -575,10 +658,19 @@
+
+             self._cancelled.discard(request_id)
+ 
+     def _roots(self, request: "Request") -> CheckpointTokenRoots:
+-        return CheckpointTokenRoots.build(
++        # [STORM] diagnosis instrument (P3): quantify fingerprint rebuild cost.
++        _storm_started = time.monotonic()
++        roots = CheckpointTokenRoots.build(
+             checkpoint_namespace(self._identity, request.cache_salt or ""),
+             request.all_token_ids,
+         )
++        logger.info(
++            "[STORM] roots request=%s tokens=%d build=%.2fs",
++            request.request_id,
++            request.num_tokens,
++            time.monotonic() - _storm_started,
++        )
++        return roots
+ 
+     def _validate_manifest(
+         self, manifest: CheckpointManifest, roots: CheckpointTokenRoots

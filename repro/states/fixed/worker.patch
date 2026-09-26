@@ -1,0 +1,99 @@
+--- a/checkpoint_transfer.py
+
++++ b/checkpoint_transfer.py
+
+@@ -2,6 +2,7 @@
+
+ """Background, metadata-only checkpoint RPC with explicit copy-lease ownership."""
+ 
+ # Standard
++import os
+ from collections.abc import Callable
+ from concurrent.futures import Future, ThreadPoolExecutor
+ from dataclasses import dataclass
+@@ -148,7 +149,72 @@
+
+         """
+         with self._lock:
+             self._closing = True
+-        self._executor.shutdown(wait=True, cancel_futures=False)
++        timeout = float(
++            os.getenv("LMCACHE_CHECKPOINT_CLOSE_TIMEOUT", "180.0")
++        )
++        logger.info("[REPRO] counters f6_close_path_fixed=1")
++        drain = threading.Thread(
++            target=self._executor.shutdown,
++            kwargs={"wait": True, "cancel_futures": False},
++            daemon=True,
++        )
++        drain.start()
++        drain.join(timeout)
++        if drain.is_alive():
++            # H3: the drain deadline is crossed, but the interpreter can
++            # still wedge past this raise — concurrent.futures' atexit
++            # hook joins the executor's non-daemon threads in
++            # threading._shutdown, and a stuck copy blocks that join
++            # forever. Arm a daemon watchdog BEFORE the raise: if
++            # teardown has not completed within the hard ceiling, log
++            # the force-exit banner and call os._exit(1). Daemon
++            # threads are killed only at the very end of interpreter
++            # finalization, and finalization is itself blocked by the
++            # non-daemon join — the wedge keeps the watchdog alive, so
++            # the _exit wins the race. Teardown-time only: this branch
++            # is unreachable while serving.
++            ceiling = float(
++                os.getenv("LMCACHE_CHECKPOINT_FORCE_EXIT_CEILING", "60.0")
++            )
++            watchdog_deadline = time.monotonic() + ceiling
++
++            def _force_exit() -> None:
++                delay = watchdog_deadline - time.monotonic()
++                if delay > 0:
++                    time.sleep(delay)
++                try:
++                    pending = self._executor._work_queue.qsize()
++                except BaseException:
++                    pending = -1
++                # The banner must not be loseable: write it to stderr
++                # directly first (no locks, no buffering), then attempt
++                # the logger (best effort — a wedged logging lock must
++                # not prevent os._exit).
++                banner = (
++                    f"[STORM] checkpoint drain force-exit: drain deadline "
++                    f"{timeout:.0f}s crossed, hard ceiling {ceiling:.0f}s "
++                    f"elapsed, pending={pending}; calling os._exit(1)"
++                )
++                try:
++                    os.write(2, (banner + chr(10)).encode())
++                except BaseException:
++                    pass
++                try:
++                    logger.error("%s", banner)
++                except BaseException:
++                    pass
++                os._exit(1)
++
++            threading.Thread(
++                target=_force_exit,
++                name="storm-drain-force-exit",
++                daemon=True,
++            ).start()
++            # The executor keeps draining in the background; the late
++            # case still surfaces via _unsafe or the process teardown.
++            raise UnsafeCheckpointCopyError(
++                f"Checkpoint copies did not drain within {timeout:.0f}s"
++            )
+         if self._unsafe:
+             raise UnsafeCheckpointCopyError("Checkpoint copies did not drain")
+ 
+@@ -288,6 +354,9 @@
+
+                     ) from drain_error
+                 raise
+         if lease.status == "miss":
++            logger.info(
++                "[REPRO] ack_reason retrieve-lease-miss rank=%s tokens=%s",
++                job.rank, job.manifest.prefix.num_tokens)
+             return False
+         if lease.status != "ready":
+             raise ValueError("Checkpoint copy requires a complete ready lease")

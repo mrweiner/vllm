@@ -1,0 +1,482 @@
+--- a/scheduler.py
+
++++ b/scheduler.py
+
+@@ -2,6 +2,7 @@
+
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
+ import math
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -90,6 +91,15 @@
+
+ logger = init_logger(__name__)
+ 
+ 
++def _storm_wait_gate(gate, skipped_waiting):
++    # [STORM] diagnosis instrument (P2): narrate a scheduler-step budget gate
++    # that exits the waiting pass while checkpoint-parked requests are held.
++    if len(skipped_waiting):
++        logger.info(
++            "[STORM] wait-gate %s parked=%d", gate, len(skipped_waiting)
++        )
++
++
+ def _build_kv_connector_block_state(
+     kv_cache_config: KVCacheConfig,
+     kv_cache_manager: KVCacheManager,
+@@ -118,6 +128,24 @@
+
+     )
+ 
+ 
++def _admission_starve_loggable(request, now, interval):
++    """True when an admission-starved request should log now.
++
++    First failure logs immediately (and stamps first-seen); afterwards at
++    most one line per `interval` seconds. State rides the request object
++    so it dies with the request (no cleanup needed).
++    """
++    last = getattr(request, "_starve_last", None)
++    if last is None:
++        request._starve_first = now
++        request._starve_last = now
++        return True
++    if now - last >= interval:
++        request._starve_last = now
++        return True
++    return False
++
++
+ class Scheduler(SchedulerInterface):
+     def __init__(
+         self,
+@@ -261,6 +289,28 @@
+
+ 
+         # KV Connector: requests in process of async KV loading or recving
+         self.finished_recving_kv_req_ids: set[str] = set()
++        # Delayed-free reaper state (f8): finished requests whose block
++        # free was deferred for a KV-transfer completion that may never
++        # arrive (dropped finished_sending/finished_recving). request_id
++        # -> time.monotonic() when the free was deferred.
++        self._delayed_free_reqs: dict[str, float] = {}
++        self._delayed_free_timeout = float(
++            os.getenv("LMCACHE_DELAYED_FREE_TIMEOUT", "600.0")
++        )
++        # f12: bounded admission-starvation relief. The age gate
++        # (~1.3x the worst recorded natural hold) only fires where
++        # natural resolution has demonstrably failed; the cooldown is
++        # >= the f5 flush bound so preemptions never stack flushes.
++        self._admission_preempt_age = float(
++            os.getenv("LMCACHE_ADMISSION_PREEMPT_AGE", "300.0")
++        )
++        self._admission_preempt_cooldown = float(
++            os.getenv("LMCACHE_ADMISSION_PREEMPT_COOLDOWN", "300.0")
++        )
++        self._admission_preempt_max_per_episode = int(
++            os.getenv("LMCACHE_ADMISSION_PREEMPT_MAX_PER_EPISODE", "1")
++        )
++        self._last_admission_preempt = float("-inf")
+         self.failed_recving_kv_req_ids: set[str] = set()
+ 
+         # Grammar compilation failures to finish as per-request errors in
+@@ -792,6 +842,107 @@
+
+         )
+ 
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
++        import time as _repro_time
++        _repro_now = _repro_time.monotonic()
++        if _repro_now - getattr(self, "_repro_last", 0.0) > 5.0:
++            self._repro_last = _repro_now
++            # Raw allocator accounting, independent of every filed
++            # fix: per-block ref_cnt scan of BlockPool.blocks.
++            # held = ref_cnt>0, shared = ref_cnt>1. Attribution
++            # (round 5): the distinct block ids reachable from the
++            # running/waiting/skipped_waiting requests' block tables;
++            # unattributed = held minus attributed — restore-pinned
++            # pages and wedged-copy destinations are held but in no
++            # request table, so they show up here. usage is the same
++            # tick's get_usage() (the metric gauge's source),
++            # recorded per sample but never a gap condition.
++            _pool = self.kv_cache_manager.block_pool
++            _held_ids = set()
++            _held = _shared = _null = 0
++            for _b in _pool.blocks:
++                if _b.is_null:
++                    _null += 1
++                    continue
++                if _b.ref_cnt == 0:
++                    continue
++                _held += 1
++                _held_ids.add(_b.block_id)
++                if _b.ref_cnt > 1:
++                    _shared += 1
++            _total = len(_pool.blocks) - _null
++            _free = _pool.get_num_free_blocks()
++            _usage = _pool.get_usage()
++            _ids = set()
++            for _req in (*self.running, *self.waiting,
++                         *self.skipped_waiting):
++                for _grp in (self.kv_cache_manager.coordinator
++                             .get_blocks(_req.request_id)):
++                    for _blk in _grp:
++                        if not _blk.is_null:
++                            _ids.add(_blk.block_id)
++            _attributed = len(_ids)
++            # Round 6 (reviewer item 1): split the unattributed held
++            # blocks by source so ordinary request-boundary retention
++            # cannot fake a pin gap. restore reservations are the
++            # staged import pins (boundary_checkpoints._pending_by_block);
++            # store pins are the bridge's in-flight task checkpoints
++            # (acquire); policy-retained bundles are the published
++            # cache entries (_by_block) the boundary policy keeps on
++            # the GPU as a matter of course; delayed frees sit in
++            # finished requests' tables awaiting the (f8-style) free.
++            # The pre-registered pin gap is restoreres+storepin+other
++            # — policyret is excluded.
++            _bc = getattr(_pool, "boundary_checkpoints", None)
++            _pend = getattr(_bc, "_pending_by_block", {}) or {}
++            _pub = getattr(_bc, "_by_block", {}) or {}
++            _pinned = set()
++            try:
++                _conn = getattr(self, "connector", None)
++                _bs = [getattr(_conn, "_scheduler", None)]
++                _bs += list(getattr(_conn, "connectors", []) or [])
++                for _bx in _bs:
++                    if _bx is None:
++                        continue
++                    for _t in (getattr(_bx, "_tasks", None)
++                               or {}).values():
++                        _ck = getattr(_t, "checkpoint", None)
++                        if _ck is not None:
++                            _pinned.update(_ck.dependencies)
++            except Exception:
++                pass
++            _delayed = set()
++            for _rid in getattr(self, "_delayed_free_reqs", {}):
++                try:
++                    for _grp in (self.kv_cache_manager.coordinator
++                                 .get_blocks(_rid)):
++                        for _blk in _grp:
++                            if not _blk.is_null:
++                                _delayed.add(_blk.block_id)
++                except Exception:
++                    pass
++            _restoreres = _storepin = _policyret = 0
++            _delayfree = _other = 0
++            for _bid in _held_ids - _ids:
++                if _bid in _pend:
++                    _restoreres += 1
++                elif _bid in _pinned:
++                    _storepin += 1
++                elif _bid in _pub:
++                    _policyret += 1
++                elif _bid in _delayed:
++                    _delayfree += 1
++                else:
++                    _other += 1
++            logger.info(
++                "[REPRO] blocks total=%d free=%d held=%d shared=%d "
++                "unaccounted=%d attributed=%d unattributed=%d "
++                "restoreres=%d storepin=%d policyret=%d "
++                "delayfree=%d other=%d usage=%.3f",
++                _total, _free, _held, _shared,
++                _total - _free - _held, _attributed,
++                _held - _attributed, _restoreres, _storepin,
++                _policyret, _delayfree, _other, _usage)
++        self._reap_delayed_free_requests()
+         self.current_step += 1
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+@@ -1127,6 +1278,17 @@
+
+                             self.connector is not None
+                             and self.connector.has_pending_block_frees()
+                         ):
++                            # [STORM] diagnosis instrument (f3/W14): a
++                            # running request that failed block allocation
++                            # while the connector holds pending block frees
++                            # breaks the decode-side allocation retry.
++                            logger.info(
++                                "[STORM] decode-free-wait-break request=%s "
++                                "tokens=%d free_blocks=%d",
++                                request.request_id,
++                                num_new_tokens,
++                                self.kv_cache_manager.block_pool.get_num_free_blocks(),
++                            )
+                             break
+ 
+                         if not allow_preemption:
+@@ -1183,6 +1345,26 @@
+
+                                     )
+                                     encoder_compute_budget += num_embeds_to_restore
+                         else:
++                            # Loud guard (f7): the FCFS victim must not
++                            # have been scheduled earlier in this step —
++                            # unlike the PRIORITY branch above, this arm
++                            # performs no same-step rollback, so a
++                            # same-step-scheduled victim would silently
++                            # free blocks the step output still claims.
++                            # H1: explicit raise instead of bare assert
++                            # -- python -O strips asserts, which would
++                            # silently disable the guard;
++                            # AssertionError keeps the crash semantics
++                            # identical under -O.
++                            if (
++                                preempted_req.request_id
++                                in num_scheduled_tokens
++                            ):
++                                raise AssertionError(
++                                    "FCFS preemption victim was scheduled this "
++                                    "step; the PRIORITY branch's same-step "
++                                    "rollback is required here"
++                                )
+                             preempted_req = self.running.pop()
+ 
+                         self._preempt_request(
+@@ -1287,11 +1469,13 @@
+
+                     input_budget <= draft_slots
+                     or draft_input_budget < separate_draft_input_tokens
+                 ):
++                    _storm_wait_gate("input-budget", self.skipped_waiting)
+                     break
+                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
+                 # in `running` but still hold a model-runner request slot.
+                 num_running = len(self.running) + self.num_waiting_for_streaming_input
+                 if num_running >= self.max_num_running_reqs:
++                    _storm_wait_gate("max-running", self.skipped_waiting)
+                     break
+ 
+                 request_queue = self._select_waiting_queue_for_scheduling()
+@@ -1741,12 +1925,71 @@
+
+                     if request.has_encoder_inputs:
+                         self.encoder_cache_manager.free(request)
+                     if not interleaved_local_prefill:
++                        # [STORM] diagnosis instrument (P4): a request that
++                        # passed the checkpoint poll but failed block
++                        # allocation breaks the waiting pass.
++                        logger.info(
++                            "[STORM] admission-break request=%s tokens=%d "
++                            "free_blocks=%d",
++                            request_id,
++                            num_new_tokens,
++                            self.kv_cache_manager.block_pool.get_num_free_blocks(),
++                        )
++                        # Shipped observability (f4): stock vLLM logs
++                        # nothing at this break; a rate-limited line
++                        # names the starved admission so a Deferred
++                        # heartbeat is explainable from stock logs.
++                        now = time.monotonic()
++                        if _admission_starve_loggable(request, now, 30.0):
++                            logger.info(
++                                "Admission starved: request %s needs %d "
++                                "tokens, %d blocks free, waiting %.0f s",
++                                request_id,
++                                num_new_tokens,
++                                self.kv_cache_manager.block_pool.get_num_free_blocks(),
++                                now - request._starve_first,
++                            )
++                        # f12: the age-bounded admission-preemption relief
++                        # runs before the break; the starved request
++                        # retries at the next step's waiting pass.
++                        self._maybe_preempt_for_starved_admission(
++                            request,
++                            num_scheduled_tokens,
++                            scheduled_timestamp,
++                            prefill_interleave_step,
++                            request_queue,
++                        )
+                         break
+                     request_queue.remove_request(request)
+                     assert prefill_interleave_step is not None
++                    # H2: interleaved-prefill allocation failures were
++                    # silent (gate round 4 S2): a request that passed
++                    # the checkpoint poll but failed block allocation
++                    # under interleaved prefill was marked unavailable
++                    # and retried next step with nothing in the log.
++                    # Dead in this deployment (max_parallel_prefills=1,
++                    # the break arm above handles it), reachable in
++                    # interleaved deployments. No starvation stamps are
++                    # set here -- the f4/f12 stamp state stays keyed to
++                    # the break arm's episode semantics.
++                    logger.info(
++                        "[STORM] admission-skip interleaved request=%s "
++                        "tokens=%d free_blocks=%d",
++                        request_id,
++                        num_new_tokens,
++                        self.kv_cache_manager.block_pool.get_num_free_blocks(),
++                    )
+                     prefill_interleave_step.mark_unavailable(request_id)
+                     step_skipped_waiting.prepend_request(request)
+                     continue
++
++                # Admission succeeded; the starvation episode ends
++                # (f4/f12): clearing the stamps makes the f4 observable
++                # report per-episode wait and resets the f12 age gate
++                # and episode preemption counter.
++                for _attr in ("_starve_first", "_starve_last", "_admission_preempts"):
++                    if hasattr(request, _attr):
++                        delattr(request, _attr)
+ 
+                 # KVTransfer: the connector uses this info to determine
+                 # if a load is needed. Note that
+@@ -2306,6 +2549,95 @@
+
+             skip.clear()
+ 
+         return new_block_ids_to_zero or None
++
++    def _maybe_preempt_for_starved_admission(
++        self,
++        request: Request,
++        num_scheduled_tokens: dict[str, int],
++        scheduled_timestamp: float,
++        prefill_interleave_step,
++        request_queue,
++    ) -> None:
++        """Bound a post-restore admission starvation by preempting a peer.
++
++        Fires at the waiting-pass admission break only when the starved
++        request has been breaking there for at least the age gate, the
++        cooldown has elapsed, and a preemptible running peer exists.
++        The victim is the passing candidate with the most primary-group
++        blocks and was not scheduled this step (a same-step-scheduled
++        victim's freed blocks are claimed by the step output). After the
++        preempt the starved request is moved to the waiting head so the
++        re-queued victim (which _preempt_request prepends) cannot
++        re-claim the freed blocks ahead of it. A still-failing starved
++        request grants no further preemptions in the same episode (the
++        cap), so a deficit preemption cannot help is a single loud
++        attempt, not a rotation.
++        """
++        stamped = getattr(request, "_starve_first", None)
++        if stamped is None:
++            return
++        now = time.monotonic()
++        if now - stamped < self._admission_preempt_age:
++            return
++        if now - self._last_admission_preempt < self._admission_preempt_cooldown:
++            return
++        if (
++            getattr(request, "_admission_preempts", 0)
++            >= self._admission_preempt_max_per_episode
++        ):
++            return
++        candidates = []
++        for peer in self.running:
++            if peer.request_id in num_scheduled_tokens:
++                continue
++            if peer.status != RequestStatus.RUNNING:
++                continue
++            if not self._request_blocks_can_be_freed(peer):
++                continue
++            # get_blocks returns KVCacheBlocks whose `.blocks` is the
++            # tuple of per-group sequences (the annotation says plain
++            # tuple, but subscripting the object raises TypeError — the
++            # 2026-09-24 21:00 live firing crashed on exactly this).
++            blocks = len(
++                self.kv_cache_manager.get_blocks(peer.request_id).blocks[0]
++            )
++            candidates.append((blocks, peer))
++        if not candidates:
++            return
++        victim_blocks, victim = max(candidates, key=lambda item: item[0])
++        free_before = self.kv_cache_manager.block_pool.get_num_free_blocks()
++        self.running.remove(victim)
++        # drop_stale_output mirrors the canonical allocate-failure
++        # preemption: connectors with a pending KV hand-off need the
++        # in-flight output marked stale (the f5 bounded flush covers
++        # in-flight stores).
++        self._preempt_request(
++            victim,
++            scheduled_timestamp,
++            drop_stale_output=self.requires_kv_delivery,
++        )
++        if prefill_interleave_step is not None:
++            prefill_interleave_step.mark_unavailable(victim.request_id)
++        # Order: the starved request is served before the re-queued
++        # victim so the freed blocks cannot be re-claimed by the
++        # victim's own cheap cache-hit re-admission (the flip-flop
++        # churn the design review identified).
++        request_queue.remove_request(request)
++        request_queue.prepend_request(request)
++        request._admission_preempts = getattr(request, "_admission_preempts", 0) + 1
++        self._last_admission_preempt = now
++        logger.info(
++            "[STORM] admission-preempt victim=%s starved=%s victim_blocks_g0=%d "
++            "free_before=%d need_tokens=%d starved_age=%.0fs "
++            "victim_preemptions=%d",
++            victim.request_id,
++            request.request_id,
++            victim_blocks,
++            free_before,
++            request.num_tokens if hasattr(request, "num_tokens") else -1,
++            now - stamped,
++            victim.num_preemptions,
++        )
+ 
+     def _preempt_request(
+         self, request: Request, timestamp: float, drop_stale_output: bool = False
+@@ -3507,11 +3839,17 @@
+
+         delay_free_blocks |= connector_delay_free_blocks
+         if not delay_free_blocks:
+             self._free_blocks(request)
++        else:
++            # The free is deferred for a KV-transfer completion (f8);
++            # stamp the request so the reaper can bound the wait.
++            self._delayed_free_reqs[request_id] = time.monotonic()
+ 
+         return kv_xfer_params, ec_xfer_params
+ 
+     def _free_blocks(self, request: Request):
+         assert request.is_finished()
++        # The deferred-free wait is over for this request (f8).
++        self._delayed_free_reqs.pop(request.request_id, None)
+         self._free_request_blocks(request)
+         del self.requests[request.request_id]
+ 
+@@ -3578,6 +3916,34 @@
+
+             - self.num_waiting_for_streaming_input
+         )
+         return num_waiting + len(self.running)
++
++    def _reap_delayed_free_requests(self) -> None:
++        """Force-free delayed-free requests whose completion never came.
++
++        A dropped finished_sending/finished_recving would otherwise leak
++        the request and its blocks forever. The deadline is deliberately
++        long (~3x the task/flush conventions): a live-but-slow copy is
++        implausible at this much completion silence, and a wedged copy
++        is already the loud-failure family.
++        """
++        if not self._delayed_free_reqs:
++            return
++        now = time.monotonic()
++        for req_id, stamped in tuple(self._delayed_free_reqs.items()):
++            if now - stamped <= self._delayed_free_timeout:
++                continue
++            req = self.requests.get(req_id)
++            if req is None:
++                # Freed by a normal completion between stamp and sweep.
++                self._delayed_free_reqs.pop(req_id, None)
++                continue
++            logger.warning(
++                "Reaped delayed-free request %s after %.0f s without a "
++                "KV-transfer completion; freeing its blocks",
++                req_id,
++                now - stamped,
++            )
++            self._free_blocks(req)
+ 
+     def has_finished_requests(self) -> bool:
+         if self.finished_req_ids:

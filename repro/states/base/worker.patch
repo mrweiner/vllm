@@ -1,0 +1,15 @@
+--- a/checkpoint_transfer.py
+
++++ b/checkpoint_transfer.py
+
+@@ -288,6 +288,9 @@
+
+                     ) from drain_error
+                 raise
+         if lease.status == "miss":
++            logger.info(
++                "[REPRO] ack_reason retrieve-lease-miss rank=%s tokens=%s",
++                job.rank, job.manifest.prefix.num_tokens)
+             return False
+         if lease.status != "ready":
+             raise ValueError("Checkpoint copy requires a complete ready lease")
